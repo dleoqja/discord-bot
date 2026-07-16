@@ -1,0 +1,23 @@
+# Secrets
+.env
+
+# Database
+*.sqlite3
+*.db
+
+# Cached champion images (Data Dragon)
+assets/champions/
+
+# 한글 폰트 — 없으면 image_card가 런타임에 받아서 캐싱한다
+assets/fonts/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/

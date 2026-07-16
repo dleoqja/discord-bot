@@ -1,0 +1,18 @@
+[Unit]
+Description=MHXX Discord Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/discord-bot
+ExecStart=/home/ubuntu/discord-bot/.venv/bin/python -m bot.main
+Restart=always
+RestartSec=5
+# 로그를 journald 로 남김 (journalctl -u mhbot 로 확인)
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
