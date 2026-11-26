@@ -4,14 +4,18 @@
 - /lol       이름#태그로 전적 카드 조회
 - /링크       내 디스코드에 롤 계정 연결
 - /내전적     연결된 내 계정 전적 바로 조회
-- /자동분석   게임 끝나면 이 채널에 자동으로 방금 판 분석 게시 (on/off)
+- /자동분석   이 채널에 게임 시작 시 인게임 정보 + 게임 종료 시 AI 한마디 분석 자동 게시 (on/off)
+- /인게임     진행 중인 게임의 참가자 10명 티어/승률 (이름 생략 시 연결된 내 계정)
 
-백그라운드: 3분마다 자동분석 켠 유저의 최근 게임을 확인해 새 게임이면 분석을 올린다.
+백그라운드: 3분마다 자동분석 켠 유저를 확인해
+  - 새 게임이 시작됐으면 인게임 정보를,
+  - 새 게임이 끝났으면 분석(+AI 한마디)을 올린다.
 """
 import asyncio
 import io
 import logging
-from collections import defaultdict
+import time
+from collections import defaultdict, deque
 from urllib.parse import quote
 
 import aiohttp
@@ -19,7 +23,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
-from bot import config, database, ddragon, image_card, lol_api
+from bot import ai, config, database, ddragon, image_card, lol_api
 
 log = logging.getLogger("bot.lol")
 
@@ -42,10 +46,44 @@ REGION_CHOICES = [
     app_commands.Choice(name="일본 (JP)", value="jp1"),
 ]
 
+# 큐 ID -> 한글 게임 모드 이름
+QUEUE_KO = {
+    400: "일반 (드래프트)", 430: "일반 (블라인드)", 490: "빠른 대전",
+    420: "솔로랭크", 440: "자유랭크", 450: "칼바람 나락",
+    700: "격전", 900: "URF", 1900: "URF", 1700: "아레나", 1710: "아레나",
+    0: "사용자 설정 게임",
+}
+TIER_KO = {
+    "IRON": "아이언", "BRONZE": "브론즈", "SILVER": "실버", "GOLD": "골드",
+    "PLATINUM": "플래티넘", "EMERALD": "에메랄드", "DIAMOND": "다이아몬드",
+    "MASTER": "마스터", "GRANDMASTER": "그랜드마스터", "CHALLENGER": "챌린저",
+}
+DIVISION_NUM = {"I": "1", "II": "2", "III": "3", "IV": "4"}
+TEAM_KO = {100: "🔵 블루팀", 200: "🔴 레드팀"}
+
+
+def _queue_name(queue_id: int | None, fallback: str = "") -> str:
+    return QUEUE_KO.get(queue_id, fallback or f"큐 {queue_id}")
+
+
+def _format_rank(entries: list[dict], queue_type: str) -> str:
+    """랭크 엔트리 목록에서 해당 큐의 '골드 2 · 45LP · 52% (120판)' 문자열을 만든다."""
+    e = next((r for r in entries if r.get("queueType") == queue_type), None)
+    if e is None:
+        return "언랭"
+    tier = TIER_KO.get(e["tier"], e["tier"])
+    if e["tier"] not in ("MASTER", "GRANDMASTER", "CHALLENGER"):
+        tier += f" {DIVISION_NUM.get(e['rank'], e['rank'])}"
+    total = e["wins"] + e["losses"]
+    wr = round(e["wins"] / total * 100) if total else 0
+    return f"{tier} · {e['leaguePoints']}LP · {wr}% ({total}판)"
+
 
 class LoL(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
+        # 같은 채널에 같은 게임 인게임 알림을 두 번 올리지 않도록 (친구끼리 같이 할 때)
+        self._posted_live: deque[tuple[int, str]] = deque(maxlen=200)
 
     async def cog_load(self) -> None:
         self.auto_analysis_loop.start()
@@ -333,12 +371,108 @@ class LoL(commands.Cog):
         if 설정 == "on":
             database.set_auto_channel(interaction.user.id, interaction.channel_id)
             await interaction.response.send_message(
-                "✅ 자동 분석을 켰어요! 게임이 끝나면 이 채널에 방금 판 분석을 올려드릴게요. "
-                "(감지까지 최대 3분)"
+                "✅ 자동 분석을 켰어요! 이 채널에 게임이 시작되면 참가자 정보를, "
+                "끝나면 방금 판 분석을 올려드릴게요. (감지까지 최대 3분)"
             )
         else:
             database.set_auto_channel(interaction.user.id, None)
             await interaction.response.send_message("🛑 자동 분석을 껐어요.", ephemeral=True)
+
+    @app_commands.command(name="인게임", description="진행 중인 게임의 참가자 티어/승률을 봅니다.")
+    @app_commands.describe(
+        riot_id="라이엇 ID (예: Hide on bush#KR1). 비우면 연결된 내 계정",
+        region="지역 (기본 kr)",
+    )
+    @app_commands.choices(region=REGION_CHOICES)
+    async def live_game(
+        self, interaction: discord.Interaction, riot_id: str | None = None, region: str = "kr"
+    ) -> None:
+        if riot_id:
+            parsed = await self._parse_riot_id(interaction, riot_id)
+            if parsed is None:
+                return
+            game_name, tag_line = parsed
+            platform = region
+            puuid = None
+        else:
+            linked = database.get_linked(interaction.user.id)
+            if not linked:
+                await interaction.response.send_message(
+                    "이름#태그를 입력하거나, 먼저 `/링크`로 내 롤 계정을 연결해주세요.",
+                    ephemeral=True,
+                )
+                return
+            game_name, tag_line = linked["game_name"], linked["tag_line"]
+            platform, puuid = linked["platform"], linked["puuid"]
+
+        await interaction.response.defer()
+        try:
+            async with self._session() as session:
+                if puuid is None:
+                    region_route = lol_api.PLATFORM_TO_REGION.get(platform, "asia")
+                    account = await lol_api.get_account(session, region_route, game_name, tag_line)
+                    puuid = account["puuid"]
+                    game_name, tag_line = account["gameName"], account["tagLine"]
+                game = await lol_api.get_active_game(session, platform, puuid)
+                if game is None:
+                    await interaction.followup.send(
+                        f"🎮 **{discord.utils.escape_markdown(game_name)}#{tag_line}** 님은 지금 게임 중이 아니에요."
+                    )
+                    return
+                embed = await self._live_game_embed(session, game, platform, puuid)
+        except lol_api.RiotAPIError as e:
+            await interaction.followup.send(f"❌ {e.message}")
+            return
+        await interaction.followup.send(embed=embed)
+
+    async def _live_game_embed(
+        self, session, game: dict, platform: str, highlight_puuid: str | None
+    ) -> discord.Embed:
+        """진행 중 게임 정보를 팀별 참가자 목록(챔피언·이름·티어) 임베드로 만든다."""
+        await ddragon.load_champion_map(session)
+        queue_id = game.get("gameQueueConfigId")
+        queue_type = "RANKED_FLEX_SR" if queue_id == 440 else "RANKED_SOLO_5x5"
+        rank_label = "자유랭크" if queue_id == 440 else "솔로랭크"
+        participants = game.get("participants", [])
+
+        sem = asyncio.Semaphore(CONCURRENCY)
+
+        async def rank_of(p: dict) -> str:
+            if p.get("bot") or not p.get("puuid"):
+                return "봇"
+            async with sem:
+                try:
+                    entries = await lol_api.get_ranked(session, platform, p["puuid"])
+                except lol_api.RiotAPIError:
+                    return "?"
+            return _format_rank(entries, queue_type)
+
+        ranks = await asyncio.gather(*(rank_of(p) for p in participants))
+
+        teams: dict[int, list[str]] = defaultdict(list)
+        for p, rank in zip(participants, ranks):
+            champ = ddragon.champ_info(p.get("championId", 0))["name"]
+            name = discord.utils.escape_markdown(p.get("riotId") or "알 수 없음")
+            line = f"**{champ}** · {name}\n└ {rank}"
+            if highlight_puuid and p.get("puuid") == highlight_puuid:
+                line = f"👉 {line}"
+            teams[p.get("teamId", 0)].append(line)
+
+        start_ms = game.get("gameStartTime") or 0
+        elapsed = f"{int((time.time() * 1000 - start_ms) / 60000)}분 진행 중" if start_ms > 0 else "로딩 중"
+        embed = discord.Embed(
+            title=f"🎮 인게임 · {_queue_name(queue_id, game.get('gameMode', ''))}",
+            description=f"{elapsed} · 티어는 {rank_label} 기준",
+            color=discord.Color.gold(),
+        )
+        for team_id in sorted(teams):
+            embed.add_field(
+                name=TEAM_KO.get(team_id, f"팀 {team_id}"),
+                value="\n".join(teams[team_id])[:1024],
+                inline=True,
+            )
+        embed.set_footer(text="powered by Riot Games API")
+        return embed
 
     async def _parse_riot_id(
         self, interaction: discord.Interaction, riot_id: str
@@ -371,6 +505,10 @@ class LoL(commands.Cog):
                 await ddragon.load_champion_map(session)
                 for acc in accounts:
                     try:
+                        await self._check_live_game(session, acc)
+                    except Exception as e:
+                        log.warning("live-game check failed: %s", e)
+                    try:
                         await self._check_new_game(session, acc)
                     except Exception as e:
                         log.warning("auto-analysis check failed: %s", e)
@@ -380,6 +518,29 @@ class LoL(commands.Cog):
     @auto_analysis_loop.before_loop
     async def _before_auto(self) -> None:
         await self.bot.wait_until_ready()
+
+    async def _check_live_game(self, session, acc: dict) -> None:
+        """새 게임이 시작됐으면 자동분석 채널에 인게임 정보를 올린다 (게임당 1회)."""
+        game = await lol_api.get_active_game(session, acc["platform"], acc["puuid"])
+        if game is None:
+            return
+        game_id = str(game.get("gameId"))
+        if game_id == acc.get("last_live_game_id"):
+            return
+        database.update_last_live_game(acc["discord_id"], game_id)
+
+        channel = self.bot.get_channel(acc["auto_channel_id"])
+        if channel is None:
+            return
+        key = (channel.id, game_id)
+        if key in self._posted_live:  # 같은 채널의 친구가 같은 게임에 있으면 이미 올렸음
+            return
+        self._posted_live.append(key)
+        embed = await self._live_game_embed(session, game, acc["platform"], acc["puuid"])
+        await channel.send(
+            content=f"<@{acc['discord_id']}> 게임이 시작됐어요! 이번 판 참가자 정보예요 ⚔️",
+            embed=embed,
+        )
 
     async def _check_new_game(self, session, acc: dict) -> None:
         region_route = lol_api.PLATFORM_TO_REGION.get(acc["platform"], "asia")
@@ -400,17 +561,54 @@ class LoL(commands.Cog):
         channel = self.bot.get_channel(acc["auto_channel_id"])
         if channel is None:
             return
-        embed = self._analysis_embed(acc, match)
-        if embed is None:
-            return
-        await channel.send(content=f"<@{acc['discord_id']}> 방금 게임 분석이 나왔어요! 🎮", embed=embed)
-
-    def _analysis_embed(self, acc: dict, match: dict) -> discord.Embed | None:
         p = next(
             (x for x in match["info"]["participants"] if x["puuid"] == acc["puuid"]), None
         )
         if p is None:
+            return
+        comment = await self._ai_comment(match, p)
+        embed = self._analysis_embed(match, p, comment)
+        await channel.send(content=f"<@{acc['discord_id']}> 방금 게임 분석이 나왔어요! 🎮", embed=embed)
+
+    async def _ai_comment(self, match: dict, p: dict) -> str | None:
+        """게임 결과를 AI(할아버지 말투)에게 보내 짧은 피드백을 받는다. 실패하면 None."""
+        if not ai.is_configured():
             return None
+        info = match["info"]
+        dur_min = (info.get("gameDuration", 0) / 60) or 1
+        team = [x for x in info["participants"] if x.get("teamId") == p.get("teamId")]
+        team_kills = sum(x["kills"] for x in team) or 1
+        kp = round((p["kills"] + p["assists"]) / team_kills * 100)
+        dmg_rank = 1 + sum(
+            1 for x in team
+            if x.get("totalDamageDealtToChampions", 0) > p.get("totalDamageDealtToChampions", 0)
+        )
+        cs = p.get("totalMinionsKilled", 0) + p.get("neutralMinionsKilled", 0)
+        pos = p.get("teamPosition") or p.get("individualPosition") or ""
+        prompt = (
+            "방금 끝난 리그 오브 레전드 게임에서 이 손주가 낸 기록이다. "
+            "할아버지 말투로 2~3문장, 150자 이내로 잘한 점이나 아쉬운 점을 콕 집어 "
+            "칭찬하거나 조언해 주거라. 숫자를 줄줄이 나열하지는 말고 핵심 한두 개만 짚어라.\n"
+            f"- 게임 모드: {_queue_name(info.get('queueId'), info.get('gameMode', ''))}\n"
+            f"- 챔피언: {ddragon.champ_info(p['championId'])['name']}\n"
+            f"- 포지션: {POSITION_KO.get(pos, pos or '알 수 없음')}\n"
+            f"- 결과: {'승리' if p['win'] else '패배'}\n"
+            f"- KDA: {p['kills']}/{p['deaths']}/{p['assists']}\n"
+            f"- 킬 관여율: {kp}%\n"
+            f"- 분당 CS: {cs / dur_min:.1f}\n"
+            f"- 분당 골드: {p.get('goldEarned', 0) / dur_min:.0f}\n"
+            f"- 챔피언 피해량: {p.get('totalDamageDealtToChampions', 0):,} (팀 내 {dmg_rank}위)\n"
+            f"- 시야 점수: {p.get('visionScore', 0)}\n"
+            f"- 게임 시간: {int(dur_min)}분"
+        )
+        try:
+            text = await ai.chat([{"role": "user", "content": prompt}])
+        except Exception as e:
+            log.warning("AI 한마디 생성 실패: %s", e)
+            return None
+        return text[:1000]
+
+    def _analysis_embed(self, match: dict, p: dict, comment: str | None) -> discord.Embed:
         info = ddragon.champ_info(p["championId"])
         dur_min = (match["info"].get("gameDuration", 0) / 60) or 1
         cs = p.get("totalMinionsKilled", 0) + p.get("neutralMinionsKilled", 0)
@@ -432,7 +630,10 @@ class LoL(commands.Cog):
             value=f"{p.get('totalDamageDealtToChampions', 0):,}",
         )
         embed.add_field(name="플레이 시간", value=f"{int(dur_min)}분")
-        embed.add_field(name="한줄평", value=self._evaluate(win, kda, cspm), inline=False)
+        if comment:
+            embed.add_field(name="👴 할아버지 한마디", value=comment, inline=False)
+        else:
+            embed.add_field(name="한줄평", value=self._evaluate(win, kda, cspm), inline=False)
 
         url = ddragon.image_url(info["id"])
         if url:

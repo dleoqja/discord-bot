@@ -30,6 +30,10 @@ def init_db() -> None:
             )
             """
         )
+        # 이전 버전 DB 마이그레이션: 자동 인게임 알림용 컬럼 추가
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(linked_accounts)")}
+        if "last_live_game_id" not in cols:
+            conn.execute("ALTER TABLE linked_accounts ADD COLUMN last_live_game_id TEXT")
         conn.commit()
 
 
@@ -81,6 +85,16 @@ def update_last_match(discord_id: int, match_id: str) -> None:
         conn.execute(
             "UPDATE linked_accounts SET last_match_id = ? WHERE discord_id = ?",
             (match_id, discord_id),
+        )
+        conn.commit()
+
+
+def update_last_live_game(discord_id: int, game_id: str) -> None:
+    """마지막으로 알린 진행 중 게임 ID를 저장한다 (인게임 알림 중복 방지용)."""
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.execute(
+            "UPDATE linked_accounts SET last_live_game_id = ? WHERE discord_id = ?",
+            (game_id, discord_id),
         )
         conn.commit()
 

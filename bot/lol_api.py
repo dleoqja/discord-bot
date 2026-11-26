@@ -38,10 +38,11 @@ class RiotAPIError(Exception):
         self.message = message
 
 
-async def _get(session: aiohttp.ClientSession, url: str) -> dict:
+async def _get(session: aiohttp.ClientSession, url: str, *, none_on_404: bool = False):
     """공통 GET 요청. 상태 코드별로 사람이 읽을 수 있는 에러로 변환.
 
     429(레이트 리밋)는 Retry-After 헤더만큼 기다렸다 자동 재시도한다.
+    none_on_404=True 면 404 를 에러 대신 None 으로 돌려준다 (예: 게임 중 아님).
     """
     headers = {"X-Riot-Token": config.RIOT_API_KEY or ""}
     for attempt in range(MAX_RETRIES):
@@ -52,6 +53,8 @@ async def _get(session: aiohttp.ClientSession, url: str) -> dict:
                 raise RiotAPIError(
                     "API 키가 없거나 만료됐어요. (개발용 키는 24시간마다 만료돼요)"
                 )
+            if resp.status == 404 and none_on_404:
+                return None
             if resp.status == 404:
                 raise RiotAPIError(
                     "소환사를 찾을 수 없어요. 이름/태그/지역을 확인해주세요."
@@ -132,3 +135,14 @@ async def get_match(
         f"https://{region}.api.riotgames.com/lol/match/v5/matches/{match_id}"
     )
     return await _get(session, url)
+
+
+async def get_active_game(
+    session: aiohttp.ClientSession, platform: str, puuid: str
+) -> dict | None:
+    """현재 진행 중인 게임 정보를 조회한다. 게임 중이 아니면 None."""
+    url = (
+        f"https://{platform}.api.riotgames.com/lol/spectator/v5/active-games/"
+        f"by-summoner/{puuid}"
+    )
+    return await _get(session, url, none_on_404=True)
