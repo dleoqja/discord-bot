@@ -1,8 +1,7 @@
-"""AI 어시스턴트 Cog — gpt4free 기반. API 키/로컬 모델 없이 동작한다.
+"""AI 어시스턴트 Cog — Groq 무료 API 기반 (.env 의 GROQ_API_KEY 필요).
 
 - /ai [질문]     : 단발 질문답변 (문맥 없음)
 - 봇을 멘션        : 대화 (채널별 최근 문맥 유지)
-- /ai초기화       : 현재 채널의 대화 문맥 초기화
 """
 import logging
 from collections import defaultdict, deque
@@ -18,6 +17,13 @@ log = logging.getLogger("bot.assistant")
 MAX_TURNS = 8        # 채널별로 기억할 최근 메시지 수 (user+assistant 합쳐서)
 MAX_INPUT = 1500     # 사용자 입력 최대 길이
 DISCORD_LIMIT = 2000  # 디스코드 메시지 글자 제한
+
+NOT_CONFIGURED_MSG = "⚠️ AI 키가 설정되지 않았어요. 봇 관리자가 `.env`에 `GROQ_API_KEY`를 넣어야 해요."
+FAILED_MSG = "⚠️ 지금 AI 응답을 받지 못했어요. 무료 사용 한도에 걸렸을 수 있으니 잠시 후 다시 시도해주세요."
+
+
+def _error_msg() -> str:
+    return FAILED_MSG if ai.is_configured() else NOT_CONFIGURED_MSG
 
 
 def _chunks(text: str, size: int = DISCORD_LIMIT) -> list[str]:
@@ -55,21 +61,12 @@ class Assistant(commands.Cog):
         try:
             answer = await self._ask(interaction.channel_id, 질문, use_history=False)
         except ai.AIError:
-            await interaction.followup.send(
-                "⚠️ 지금 AI 응답을 받지 못했어요. 무료 서버가 불안정할 수 있으니 잠시 후 다시 시도해주세요."
-            )
+            await interaction.followup.send(_error_msg())
             return
         chunks = _chunks(answer)
         await interaction.followup.send(chunks[0])
         for c in chunks[1:]:
             await interaction.followup.send(c)
-
-    @app_commands.command(name="ai초기화", description="이 채널의 AI 대화 문맥을 초기화합니다.")
-    async def reset_cmd(self, interaction: discord.Interaction) -> None:
-        self.history.pop(interaction.channel_id, None)
-        await interaction.response.send_message(
-            "🧹 이 채널의 대화 문맥을 초기화했어요.", ephemeral=True
-        )
 
     # ────────────────────────── 멘션 대화 ──────────────────────────
 
@@ -95,9 +92,7 @@ class Assistant(commands.Cog):
             try:
                 answer = await self._ask(message.channel.id, content, use_history=True)
             except ai.AIError:
-                await message.reply(
-                    "⚠️ 지금 AI 응답을 받지 못했어요. 잠시 후 다시 시도해주세요."
-                )
+                await message.reply(_error_msg())
                 return
 
         chunks = _chunks(answer)

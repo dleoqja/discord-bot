@@ -1,16 +1,26 @@
-"""gpt4free(g4f) 기반 무료 LLM 헬퍼 — API 키/로컬 모델 없이 동작한다.
+"""Groq 무료 API 기반 LLM 헬퍼.
 
-무료 공개 엔드포인트를 경유하므로 특정 provider/model이 수시로 죽는다.
-따라서 여러 모델을 순서대로 시도해 하나라도 성공하면 그 응답을 쓴다.
+Groq 은 카드 없이 무료 API 키를 발급해 주고(https://console.groq.com/keys),
+OpenAI 호환 엔드포인트를 제공한다. 무료 티어는 모델별 분당/일일 한도가 있으므로
+한 모델이 한도 초과(429)나 오류를 내면 다음 모델로 넘어간다.
 """
 import logging
 
-from g4f.client import AsyncClient
+import aiohttp
+
+from bot import config
+from bot.lol_api import ssl_context
 
 log = logging.getLogger("bot.ai")
 
-# 앞에서부터 순서대로 시도 (무료 provider가 자주 불안정하므로 폴백 체인)
-_MODELS = ["gpt-4o-mini", "gpt-4o", "llama-3.3-70b", "gemini-1.5-flash"]
+API_URL = "https://api.groq.com/openai/v1/chat/completions"
+
+# 앞에서부터 순서대로 시도 (.env 의 GROQ_MODEL 이 있으면 그것을 맨 앞에)
+_DEFAULT_MODELS = [
+    "openai/gpt-oss-120b",
+    "llama-3.3-70b-versatile",
+    "llama-3.1-8b-instant",
+]
 
 SYSTEM_PROMPT = (
     "너는 디스코드 서버의 인자한 할아버지 AI 어시스턴트다. "
@@ -23,7 +33,18 @@ SYSTEM_PROMPT = (
 
 
 class AIError(Exception):
-    """모든 무료 모델이 응답에 실패했을 때 발생."""
+    """모든 모델이 응답에 실패했을 때 발생."""
+
+
+def is_configured() -> bool:
+    return bool(config.GROQ_API_KEY)
+
+
+def _models() -> list[str]:
+    models = list(_DEFAULT_MODELS)
+    if config.GROQ_MODEL:
+        models = [config.GROQ_MODEL] + [m for m in models if m != config.GROQ_MODEL]
+    return models
 
 
 async def chat(messages: list[dict]) -> str:
@@ -31,20 +52,41 @@ async def chat(messages: list[dict]) -> str:
 
     messages 예: [{"role": "user", "content": "..."}, {"role": "assistant", ...}, ...]
     """
-    client = AsyncClient()
-    full = [{"role": "system", "content": SYSTEM_PROMPT}, *messages]
-    last_err: Exception | None = None
+    if not is_configured():
+        raise AIError("GROQ_API_KEY 가 설정되지 않았습니다.")
 
-    for model in _MODELS:
-        try:
-            resp = await client.chat.completions.create(model=model, messages=full)
-            content = (resp.choices[0].message.content or "").strip()
+    full = [{"role": "system", "content": SYSTEM_PROMPT}, *messages]
+    headers = {
+        "Authorization": f"Bearer {config.GROQ_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    last_err = "응답을 받지 못했습니다."
+    timeout = aiohttp.ClientTimeout(total=60)
+
+    async with aiohttp.ClientSession(
+        timeout=timeout, connector=aiohttp.TCPConnector(ssl=ssl_context())
+    ) as session:
+        for model in _models():
+            payload = {"model": model, "messages": full, "max_tokens": 1024}
+            try:
+                async with session.post(API_URL, json=payload, headers=headers) as resp:
+                    if resp.status != 200:
+                        body = (await resp.text())[:300]
+                        last_err = f"{model}: HTTP {resp.status} {body}"
+                        log.warning("model %s 실패: HTTP %s %s", model, resp.status, body)
+                        if resp.status == 401:  # 키 문제는 다른 모델로 바꿔도 같음
+                            break
+                        continue
+                    data = await resp.json()
+            except (aiohttp.ClientError, TimeoutError) as e:
+                last_err = f"{model}: {e!r}"
+                log.warning("model %s 실패: %r", model, e)
+                continue
+
+            content = (data["choices"][0]["message"].get("content") or "").strip()
             if content:
                 log.info("AI 응답 성공 (model=%s, %d자)", model, len(content))
                 return content
             log.warning("model %s: 빈 응답", model)
-        except Exception as e:  # 무료 provider는 온갖 예외를 던진다
-            last_err = e
-            log.warning("model %s 실패: %s", model, e)
 
-    raise AIError(str(last_err) if last_err else "응답을 받지 못했습니다.")
+    raise AIError(last_err)
