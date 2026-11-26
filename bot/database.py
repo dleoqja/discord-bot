@@ -1,4 +1,5 @@
 """SQLite 기반 간단 데이터 계층 (유저 포인트 저장/조회)."""
+import json
 import sqlite3
 from contextlib import closing
 
@@ -27,6 +28,20 @@ def init_db() -> None:
                 platform        TEXT NOT NULL,
                 auto_channel_id INTEGER,
                 last_match_id   TEXT
+            )
+            """
+        )
+        # 파티 모집 글 (/모집) — 재시작 후에도 버튼이 동작하도록 상태를 저장
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS recruits (
+                message_id   INTEGER PRIMARY KEY,
+                channel_id   INTEGER NOT NULL,
+                host_id      INTEGER NOT NULL,
+                game         TEXT NOT NULL,
+                time_text    TEXT NOT NULL,
+                max_players  INTEGER NOT NULL,
+                participants TEXT NOT NULL DEFAULT '[]'
             )
             """
         )
@@ -107,6 +122,47 @@ def all_auto_accounts() -> list[dict]:
             "SELECT * FROM linked_accounts WHERE auto_channel_id IS NOT NULL"
         ).fetchall()
         return [dict(r) for r in rows]
+
+
+# ── 파티 모집 ──
+
+def create_recruit(
+    message_id: int, channel_id: int, host_id: int,
+    game: str, time_text: str, max_players: int, participants: list[int],
+) -> None:
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.execute(
+            """
+            INSERT INTO recruits
+                (message_id, channel_id, host_id, game, time_text, max_players, participants)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (message_id, channel_id, host_id, game, time_text, max_players,
+             json.dumps(participants)),
+        )
+        conn.commit()
+
+
+def get_recruit(message_id: int) -> dict | None:
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM recruits WHERE message_id = ?", (message_id,)
+        ).fetchone()
+    if not row:
+        return None
+    rec = dict(row)
+    rec["participants"] = json.loads(rec["participants"])
+    return rec
+
+
+def set_recruit_participants(message_id: int, participants: list[int]) -> None:
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.execute(
+            "UPDATE recruits SET participants = ? WHERE message_id = ?",
+            (json.dumps(participants), message_id),
+        )
+        conn.commit()
 
 
 def add_points(user_id: int, amount: int) -> int:

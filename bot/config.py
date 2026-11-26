@@ -26,4 +26,5 @@ INITIAL_COGS = [
     "bot.cogs.lol",
     "bot.cogs.mhxx",
     "bot.cogs.assistant",
+    "bot.cogs.recruit",
 ]
